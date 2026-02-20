@@ -55,3 +55,4 @@ logs/backtest_trades.csv
 .idea/
 *.swp
 *.swo
+node_modules/
