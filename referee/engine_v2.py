@@ -36,6 +36,7 @@ from referee import position_manager
 from quant import regime_hmm
 from quant.earnings_filter import filter_watchlist
 from quant.correlation_guard import filter_by_correlation
+from quant.regime_hmm import get_latest_regime_full
 
 load_dotenv()
 
@@ -53,6 +54,10 @@ data_client       = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 WATCHLIST   = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
 BENCHMARKS  = ["SPY", "QQQ"]   # used for neutralization, not traded
+CRISIS_ETF  = "SQQQ"           # 3× inverse QQQ — bought during Crisis
+CRISIS_ETF_RISK_PCT  = 0.03    # 3% equity into SQQQ hedge
+CRISIS_SHORT_RISK_PCT = 0.02   # 2% equity into weakest-symbol short
+CRISIS_CONF_THRESHOLD = 0.90   # only hedge if HMM is ≥90% confident in Crisis
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BASE_RISK_PCT   = 0.02    # 2% equity per trade (floor)
@@ -177,6 +182,165 @@ def log_tug_result(result: dict) -> Optional[str]:
         return None
 
 
+# ── Crisis Hedging ───────────────────────────────────────────────────────────
+
+def get_weakest_symbol() -> Optional[str]:
+    """
+    Find the watchlist symbol with the worst 5-day return.
+    Used to pick the short target during Crisis.
+    """
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from datetime import timedelta
+    worst_sym  = None
+    worst_ret  = float("inf")
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=10)
+    for sym in WATCHLIST:
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=sym,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+                feed=DataFeed.IEX,
+            )
+            bars = data_client.get_stock_bars(req)
+            df   = bars[sym].df if hasattr(bars[sym], "df") else bars.df
+            if len(df) < 2:
+                continue
+            ret5 = (df["close"].iloc[-1] - df["close"].iloc[-min(5, len(df))]) / df["close"].iloc[-min(5, len(df))]
+            if ret5 < worst_ret:
+                worst_ret = ret5
+                worst_sym = sym
+        except Exception:
+            continue
+    print(f"[CRISIS] Weakest symbol: {worst_sym} (5d ret={worst_ret:.2%})")
+    return worst_sym
+
+
+def execute_crisis_hedges(equity: float, crisis_confidence: float):
+    """
+    Two-pronged Crisis hedge:
+      1. Buy SQQQ (3× inverse QQQ) — profits as QQQ falls
+      2. Short the weakest watchlist symbol — pure alpha short
+
+    Only fires if:
+      - Crisis confidence >= CRISIS_CONF_THRESHOLD (90%)
+      - No existing SQQQ position already open
+      - Market is open
+    """
+    if crisis_confidence < CRISIS_CONF_THRESHOLD:
+        print(f"[CRISIS] Confidence {crisis_confidence:.2%} < {CRISIS_CONF_THRESHOLD:.0%} threshold — skipping hedges")
+        return
+
+    # ── 1. Inverse ETF hedge (SQQQ) ───────────────────────────
+    sqqq_held = get_existing_position_qty(CRISIS_ETF)
+    if sqqq_held > 0:
+        print(f"[CRISIS] SQQQ hedge already open ({sqqq_held} shares) — skipping")
+    else:
+        mid = get_mid_price(CRISIS_ETF)
+        qty = max(int((equity * CRISIS_ETF_RISK_PCT) / mid), 1)
+        limit_price = round(mid * (1 + LIMIT_SLIP_PCT), 2)
+        try:
+            order = trading_client.submit_order(LimitOrderRequest(
+                symbol=CRISIS_ETF,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.IOC,
+                limit_price=limit_price,
+            ))
+            print(f"[CRISIS] SQQQ hedge: BUY {qty} @ ${limit_price} (IOC) | conf={crisis_confidence:.2%} | ID={order.id}")
+            if USER_ID:
+                supabase.table("trades").insert({
+                    "symbol": CRISIS_ETF,
+                    "side": "buy",
+                    "qty": qty,
+                    "order_type": "limit",
+                    "order_type_detail": "crisis_hedge_sqqq",
+                    "limit_price": limit_price,
+                    "alpaca_order_id": str(order.id),
+                    "status": "pending",
+                    "implementation_shortfall_bps": round(abs(limit_price - mid) / mid * 10000, 2),
+                    "user_id": USER_ID,
+                }).execute()
+        except Exception as e:
+            print(f"[CRISIS] SQQQ order error: {e}")
+
+    # ── 2. Short weakest watchlist symbol ─────────────────────
+    short_sym = get_weakest_symbol()
+    if not short_sym:
+        print("[CRISIS] Could not determine weakest symbol — skipping short")
+        return
+
+    already_short = get_existing_position_qty(short_sym)
+    if already_short < 0:
+        print(f"[CRISIS] Already short {short_sym} — skipping")
+        return
+    if already_short > 0:
+        print(f"[CRISIS] Long position in {short_sym} — closing before shorting")
+        try:
+            trading_client.close_position(short_sym)
+        except Exception as e:
+            print(f"[CRISIS] Could not close {short_sym} long: {e}")
+            return
+
+    mid   = get_mid_price(short_sym)
+    qty   = max(int((equity * CRISIS_SHORT_RISK_PCT) / mid), 1)
+    limit_price = round(mid * (1 - LIMIT_SLIP_PCT), 2)
+    try:
+        order = trading_client.submit_order(LimitOrderRequest(
+            symbol=short_sym,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,   # shorts must be DAY orders on Alpaca paper
+            limit_price=limit_price,
+        ))
+        print(f"[CRISIS] Short {short_sym}: SELL {qty} @ ${limit_price} (DAY) | conf={crisis_confidence:.2%} | ID={order.id}")
+        if USER_ID:
+            supabase.table("trades").insert({
+                "symbol": short_sym,
+                "side": "sell",
+                "qty": qty,
+                "order_type": "limit",
+                "order_type_detail": "crisis_short_weakest",
+                "limit_price": limit_price,
+                "alpaca_order_id": str(order.id),
+                "status": "pending",
+                "implementation_shortfall_bps": round(abs(limit_price - mid) / mid * 10000, 2),
+                "user_id": USER_ID,
+            }).execute()
+    except Exception as e:
+        print(f"[CRISIS] Short order error for {short_sym}: {e}")
+
+
+def close_crisis_hedges():
+    """
+    Called when regime flips OUT of Crisis.
+    Closes SQQQ position and any active crisis shorts.
+    """
+    # Close SQQQ
+    sqqq_held = get_existing_position_qty(CRISIS_ETF)
+    if sqqq_held > 0:
+        try:
+            trading_client.close_position(CRISIS_ETF)
+            print(f"[CRISIS] Closed SQQQ hedge ({sqqq_held} shares) — regime no longer Crisis")
+        except Exception as e:
+            print(f"[CRISIS] Error closing SQQQ: {e}")
+    # Close any shorts on watchlist symbols (negative qty = short)
+    try:
+        positions = trading_client.get_all_positions()
+        for pos in positions:
+            if pos.symbol in WATCHLIST and float(pos.qty) < 0:
+                try:
+                    trading_client.close_position(pos.symbol)
+                    print(f"[CRISIS] Closed crisis short: {pos.symbol} ({pos.qty} shares)")
+                except Exception as e:
+                    print(f"[CRISIS] Error closing short {pos.symbol}: {e}")
+    except Exception as e:
+        print(f"[CRISIS] Error fetching positions for short close: {e}")
+
+
 # ── Execution ─────────────────────────────────────────────────────────────────
 
 def execute_trade(
@@ -268,13 +432,24 @@ def run_cycle():
         return
 
     # ── Regime check ──────────────────────────────────────────
-    regime = regime_hmm.get_latest_regime()
-    print(f"[REFEREE] Regime: {regime.upper()}")
+    regime_data = get_latest_regime_full()
+    regime      = regime_data["state"]
+    crisis_conf = regime_data["confidence"]
+    print(f"[REFEREE] Regime: {regime.upper()} (conf={crisis_conf:.2%})")
 
     if regime == "crisis":
-        print("[REFEREE] CRISIS regime — halting all trading, closing positions")
+        print("[REFEREE] CRISIS regime — closing longs, deploying hedges")
         position_manager.run_exit_checks({}, {}, force_close=True)
+        equity = get_account_equity()
+        execute_crisis_hedges(equity, crisis_conf)
         return
+
+    # If we just exited Crisis, clean up any open hedges
+    _prev_regime = getattr(run_cycle, "_last_regime", "trend")
+    if _prev_regime == "crisis" and regime != "crisis":
+        print("[REFEREE] Regime flipped out of Crisis — closing hedges")
+        close_crisis_hedges()
+    run_cycle._last_regime = regime
 
     equity = get_account_equity()
     print(f"[REFEREE] Account equity: ${equity:,.2f}")

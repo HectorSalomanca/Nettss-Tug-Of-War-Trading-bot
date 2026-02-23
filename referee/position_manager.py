@@ -143,10 +143,17 @@ def run_exit_checks(
 
     print(f"[POS_MGR] Checking {len(positions)} open position(s) | regime={regime}...")
 
-    # Force close (crisis regime)
+    # Force close (crisis regime) — skip SQQQ hedge and any shorts (they're intentional)
     if force_close:
-        print("[POS_MGR] Force close — crisis regime, closing all positions")
+        print("[POS_MGR] Force close — crisis regime, closing long positions")
         for pos in positions:
+            qty = float(pos.qty)
+            if pos.symbol == "SQQQ":
+                print(f"[POS_MGR] Keeping SQQQ crisis hedge — skipping")
+                continue
+            if qty < 0:
+                print(f"[POS_MGR] Keeping short {pos.symbol} ({qty}) — crisis short, skipping")
+                continue
             close_position(pos.symbol, "CRISIS_HALT")
         return
 

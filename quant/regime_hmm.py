@@ -181,14 +181,22 @@ def log_regime(regime: dict):
 
 def get_latest_regime() -> str:
     """
-    Fast path: read the most recent regime from Supabase
-    instead of re-fitting the HMM every cycle.
+    Fast path: read the most recent regime from Supabase.
     Falls back to 'trend' if no record found.
+    """
+    r = get_latest_regime_full()
+    return r["state"]
+
+
+def get_latest_regime_full() -> dict:
+    """
+    Returns full regime dict: {state, confidence, spy_volatility, spy_momentum}.
+    Falls back to trend/0.5 defaults if no record found.
     """
     try:
         result = (
             supabase.table("regime_states")
-            .select("state, created_at")
+            .select("state, confidence, spy_volatility, spy_momentum, created_at")
             .order("created_at", desc=True)
             .limit(1)
             .execute()
@@ -200,10 +208,15 @@ def get_latest_regime() -> str:
                 datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             ).total_seconds()
             if age_seconds < 1800:
-                return row["state"]
+                return {
+                    "state":          row["state"],
+                    "confidence":     row.get("confidence", 0.5),
+                    "spy_volatility": row.get("spy_volatility", 0.0),
+                    "spy_momentum":   row.get("spy_momentum", 0.0),
+                }
     except Exception:
         pass
-    return "trend"
+    return {"state": "trend", "confidence": 0.5, "spy_volatility": 0.0, "spy_momentum": 0.0}
 
 
 def run_and_log() -> dict:
