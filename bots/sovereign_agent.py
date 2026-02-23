@@ -233,21 +233,44 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     alt_dir = alt_signal["direction"]
     alt_conf = alt_signal["confidence"]
 
-    # ── RSI + MACD from daily bars ────────────────────────────
+    # ── RSI + MACD + Volume Surge + 52W Position + MA20 ──────────────
     rsi_val = 50.0
     macd_signal = 0.0
+    vol_surge_ratio = 1.0   # today vol / 20d avg vol
+    pct_52w = 0.5           # 0=52w low, 1=52w high
+    price_vs_ma20 = 0.0     # % above/below 20-day MA
     try:
         close_s = pd.Series(prices)
+        vol_s   = pd.Series(df["volume"].values)
+
+        # RSI
         delta = close_s.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rs = gain / (loss + 1e-8)
         rsi_val = float((100 - 100 / (1 + rs)).iloc[-1])
+
+        # MACD histogram
         ema12 = close_s.ewm(span=12, adjust=False).mean()
         ema26 = close_s.ewm(span=26, adjust=False).mean()
         macd_line = ema12 - ema26
         macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
-        macd_signal = float(macd_line.iloc[-1] - macd_sig.iloc[-1])  # histogram
+        macd_signal = float(macd_line.iloc[-1] - macd_sig.iloc[-1])
+
+        # Volume surge: today's vol vs 20-day average
+        avg_vol_20 = float(vol_s.rolling(20).mean().iloc[-1])
+        today_vol  = float(vol_s.iloc[-1])
+        vol_surge_ratio = today_vol / max(avg_vol_20, 1)
+
+        # 52-week position: where is price in its annual range?
+        hi_52 = float(close_s.rolling(min(252, len(close_s))).max().iloc[-1])
+        lo_52 = float(close_s.rolling(min(252, len(close_s))).min().iloc[-1])
+        rng = hi_52 - lo_52
+        pct_52w = (prices[-1] - lo_52) / rng if rng > 0 else 0.5
+
+        # Price vs 20-day MA
+        ma20 = float(close_s.rolling(20).mean().iloc[-1])
+        price_vs_ma20 = (prices[-1] - ma20) / ma20
     except Exception:
         pass
 
@@ -335,6 +358,42 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     else:
         details["macd_signal"] = "neutral"
     details["macd_histogram"] = round(macd_signal, 4)
+
+    # Volume surge (2 points): >1.5x avg vol = conviction; <0.6x = fading
+    if vol_surge_ratio > 1.5:
+        # Volume surge confirms direction of price move
+        if price_vs_ma20 > 0:
+            bull += 2
+        else:
+            bear += 2
+        details["vol_surge"] = "high"
+    elif vol_surge_ratio < 0.6:
+        details["vol_surge"] = "low"
+    else:
+        details["vol_surge"] = "normal"
+    details["vol_surge_ratio"] = round(vol_surge_ratio, 2)
+
+    # 52-week position (2 points): near highs = momentum, near lows = mean-reversion
+    if pct_52w > 0.80:
+        bull += 2   # near 52w high = momentum breakout
+        details["52w_position"] = "near_high"
+    elif pct_52w < 0.20:
+        bull += 2   # near 52w low = mean-reversion bounce candidate
+        details["52w_position"] = "near_low"
+    else:
+        details["52w_position"] = "mid_range"
+    details["pct_52w"] = round(pct_52w, 3)
+
+    # Price vs 20-day MA (2 points): trend direction filter
+    if price_vs_ma20 > 0.01:   # >1% above MA20 = uptrend
+        bull += 2
+        details["ma20_signal"] = "above"
+    elif price_vs_ma20 < -0.01:  # >1% below MA20 = downtrend
+        bear += 2
+        details["ma20_signal"] = "below"
+    else:
+        details["ma20_signal"] = "at_ma"
+    details["price_vs_ma20"] = round(price_vs_ma20, 4)
 
     total = bull + bear
     if total == 0:

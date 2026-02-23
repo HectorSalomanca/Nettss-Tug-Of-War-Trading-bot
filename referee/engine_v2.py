@@ -48,6 +48,7 @@ from quant.meta_model import compute_ensemble_score
 from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES
 from quant.feature_factory import build_features
 from referee.net_guard import is_online, with_retry
+from quant.labeler import run_nightly_labeling
 
 load_dotenv()
 
@@ -741,6 +742,30 @@ def execute_trade(
         day_shortfall = round(abs(day_limit - mid_price) / mid_price * 10000, 2)
         print(f"[REFEREE] DAY fallback: {side.upper()} {int(qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps | ID={day_id}")
 
+        # Check if DAY order filled immediately (extended hours often fills fast)
+        time.sleep(3)
+        day_status = trading_client.get_order_by_id(day_id)
+        day_status_str = str(day_status.status).lower()
+        day_filled_qty = float(day_status.filled_qty or 0)
+        day_filled_price = float(day_status.filled_avg_price or day_limit)
+
+        if "filled" in day_status_str and day_filled_qty > 0:
+            real_shortfall = round(abs(day_filled_price - mid_price) / mid_price * 10000, 2)
+            print(f"[FILL] {asym}: DAY FILLED {int(day_filled_qty)} @ ${day_filled_price:.2f}")
+            # Place bracket immediately on confirmed fill
+            _place_bracket_orders(symbol, side, day_filled_price, int(day_filled_qty), regime)
+            if USER_ID:
+                supabase.table("trades").insert({
+                    "tug_result_id": tug_result_id, "symbol": symbol,
+                    "side": side, "qty": int(day_filled_qty),
+                    "order_type": "limit", "order_type_detail": "limit_day_fallback",
+                    "limit_price": day_filled_price, "alpaca_order_id": day_id,
+                    "status": "filled", "implementation_shortfall_bps": real_shortfall,
+                    "user_id": USER_ID,
+                }).execute()
+            return {"alpaca_order_id": day_id, "qty": int(day_filled_qty), "side": side, "shortfall_bps": real_shortfall}
+
+        # Still pending — log as pending, reconciliation will update + bracket on next cycle
         if USER_ID:
             supabase.table("trades").insert({
                 "tug_result_id": tug_result_id, "symbol": symbol,
@@ -1020,6 +1045,14 @@ def _run_hmm_background():
         print(f"[REFEREE] HMM refresh error: {e}")
 
 
+def _run_labeler_background():
+    """Label any unlabeled filled trades with Triple Barrier outcomes."""
+    try:
+        run_nightly_labeling()
+    except Exception as e:
+        print(f"[REFEREE] Labeler error: {e}")
+
+
 # ── Schedulers ────────────────────────────────────────────────────────────────
 
 def run_once():
@@ -1036,6 +1069,7 @@ def run_scheduled(interval_minutes: int = 15):
     schedule.every(interval_minutes).minutes.do(run_cycle)
     schedule.every(30).minutes.do(_run_scout_background)
     schedule.every(60).minutes.do(_run_hmm_background)
+    schedule.every(4).hours.do(_run_labeler_background)
 
     run_cycle()
     while True:

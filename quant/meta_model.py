@@ -34,7 +34,7 @@ DEFAULT_WEIGHTS = {
     "hmm":         0.25,   # HMM regime posterior
 }
 
-NEUTRALIZATION_PCT = 0.50  # 50% neutralization against SPY beta
+NEUTRALIZATION_PCT = 0.0   # Disabled: neutralization was halving all scores (same bug as sovereign)
 
 
 # ── OFI Regression ───────────────────────────────────────────────────────────
@@ -175,8 +175,8 @@ def compute_ensemble_score(
         weights["hmm"]         * hmm_score
     )
 
-    # Feature neutralization
-    final_score = neutralize_score(raw_score, spy_beta)
+    # No neutralization — it was compressing all scores toward 0, killing signal
+    final_score = float(np.clip(raw_score, -1.0, 1.0))
 
     # Map to direction + confidence
     if final_score > 0.05:
