@@ -27,7 +27,7 @@ from supabase import create_client, Client
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest, TakeProfitRequest, StopLossRequest,
-    GetOrdersRequest,
+    GetOrdersRequest, StopLimitOrderRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -97,6 +97,10 @@ ENSEMBLE_BUY_THRESHOLD  = 0.12   # ensemble score > this → execute buy
 ENSEMBLE_SELL_THRESHOLD = -0.12  # ensemble score < this → execute sell
 
 ET = pytz.timezone("America/New_York")
+
+# ── Crisis streak counter (Fix 1: require 2 consecutive crisis readings) ───────
+_crisis_streak = 0   # incremented each cycle crisis is detected, reset otherwise
+CRISIS_STREAK_REQUIRED = 2  # must see crisis N times in a row before acting
 
 # ── Offline cache path ─────────────────────────────────────────────────────────
 _BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -241,13 +245,13 @@ def get_mid_price(symbol: str) -> float:
 
 
 def compute_qty(symbol: str, kelly_fraction: float, equity: float, is_strong: bool) -> tuple:
-    """Returns (qty, mid_price, limit_price)."""
+    """Returns (qty, mid_price, limit_price). qty is always a whole int."""
     mid = get_mid_price(symbol)
     size_mult  = 1.0 if is_strong else 0.6
     kelly_boost = min(kelly_fraction * 2, MAX_RISK_PCT - BASE_RISK_PCT)
     risk_pct   = min(BASE_RISK_PCT + kelly_boost, MAX_RISK_PCT) * size_mult
     position_value = equity * risk_pct
-    qty = max(int(position_value / mid), 1)   # Limit IOC requires whole shares
+    qty = max(int(position_value / mid), 1)   # int() here — never a float
     return qty, mid, mid
 
 
@@ -599,44 +603,47 @@ def close_crisis_hedges():
 
 def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int, regime: str):
     """
-    After a position fills, immediately submit an OCO bracket on Alpaca's servers:
-      - Stop-market at off-round stop% below/above entry
-      - Take-profit limit at off-round take% above/below entry
-
+    After a position fills, submit GTC stop-limit + GTC take-profit on Alpaca's servers.
     These execute even when the laptop is offline.
-    For buys:  stop below entry, take above entry.
-    For sells: stop above entry, take below entry.
+
+    Stop leg: StopLimitOrderRequest
+      - stop_price  = entry ± stop_pct  (trigger level)
+      - limit_price = stop_price ± 0.3% buffer (execution limit, avoids immediate trigger)
+    Take leg: LimitOrderRequest at take_price (GTC)
     """
     stops = REGIME_STOPS.get(regime, REGIME_STOPS["trend"])
     stop_pct = stops["stop"]
     take_pct = stops["take"]
 
     if stop_pct == 0.0:
-        return  # Crisis regime — no bracket (position shouldn't exist)
+        return  # Crisis regime — no bracket
+
+    # 0.3% execution buffer so the limit doesn't trigger on normal intraday noise
+    STOP_LIMIT_BUFFER = 0.003
 
     asym = _alpaca_sym(symbol)
     try:
         if side == "buy":
-            stop_price = round(filled_price * (1 - stop_pct), 2)
-            take_price = round(filled_price * (1 + take_pct), 2)
-            # Exit side is SELL
-            exit_side = OrderSide.SELL
+            stop_trigger = round(filled_price * (1 - stop_pct), 2)
+            stop_limit   = round(stop_trigger * (1 - STOP_LIMIT_BUFFER), 2)  # slightly below trigger
+            take_price   = round(filled_price * (1 + take_pct), 2)
+            exit_side    = OrderSide.SELL
         else:
-            stop_price = round(filled_price * (1 + stop_pct), 2)
-            take_price = round(filled_price * (1 - take_pct), 2)
-            exit_side = OrderSide.BUY
+            stop_trigger = round(filled_price * (1 + stop_pct), 2)
+            stop_limit   = round(stop_trigger * (1 + STOP_LIMIT_BUFFER), 2)  # slightly above trigger
+            take_price   = round(filled_price * (1 - take_pct), 2)
+            exit_side    = OrderSide.BUY
 
-        # OCO: One-Cancels-Other — submit both legs, Alpaca cancels the other when one fills
-        # Stop-market leg
-        stop_req = LimitOrderRequest(
+        # Stop leg: proper StopLimitOrderRequest — only triggers when price crosses stop_trigger
+        stop_req = StopLimitOrderRequest(
             symbol=asym,
             qty=qty,
             side=exit_side,
             time_in_force=TimeInForce.GTC,
-            limit_price=stop_price,
-            stop_price=stop_price,
+            stop_price=stop_trigger,
+            limit_price=stop_limit,
         )
-        # Take-profit leg (limit order at take price)
+        # Take-profit leg: plain GTC limit at take_price
         take_req = LimitOrderRequest(
             symbol=asym,
             qty=qty,
@@ -644,10 +651,9 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
             time_in_force=TimeInForce.GTC,
             limit_price=take_price,
         )
-        # Submit stop-market as GTC stop-limit (Alpaca paper supports this)
         trading_client.submit_order(stop_req)
         trading_client.submit_order(take_req)
-        print(f"[BRACKET] {asym}: stop=${stop_price} ({stop_pct:.1%}) | take=${take_price} ({take_pct:.1%}) | regime={regime}")
+        print(f"[BRACKET] {asym}: stop_trigger=${stop_trigger} stop_limit=${stop_limit} ({stop_pct:.1%}) | take=${take_price} ({take_pct:.1%}) | regime={regime}")
     except Exception as e:
         print(f"[BRACKET] {asym}: bracket order error — {e}")
 
@@ -795,19 +801,32 @@ def run_cycle():
     crisis_conf = regime_data["confidence"]
     print(f"[REFEREE] Regime: {regime.upper()} (conf={crisis_conf:.2%})")
 
+    # Fix 1: Crisis streak — require CRISIS_STREAK_REQUIRED consecutive readings
+    # before acting. Prevents single HMM noise spike from triggering $34 of churn.
+    global _crisis_streak
     if regime == "crisis":
-        print("[REFEREE] CRISIS regime — closing longs, deploying hedges")
+        _crisis_streak += 1
+        print(f"[REFEREE] CRISIS streak: {_crisis_streak}/{CRISIS_STREAK_REQUIRED}")
+        if _crisis_streak < CRISIS_STREAK_REQUIRED:
+            print(f"[REFEREE] Crisis not confirmed yet — waiting for streak ({_crisis_streak}/{CRISIS_STREAK_REQUIRED})")
+            # Still run exit checks on open positions, but don't deploy hedges yet
+            equity = get_account_equity()
+            position_manager.run_exit_checks({}, {}, regime="trend")
+            return
+        # Confirmed crisis — act
+        print("[REFEREE] CRISIS confirmed — closing longs, deploying hedges")
         position_manager.run_exit_checks({}, {}, force_close=True)
         equity = get_account_equity()
         execute_crisis_hedges(equity, crisis_conf)
         return
+    else:
+        _crisis_streak = 0  # reset streak on any non-crisis reading
 
     # P2: Always clean up stale crisis hedges if regime is NOT crisis
-    if regime != "crisis":
-        sqqq_held = get_existing_position_qty(CRISIS_ETF)
-        if sqqq_held > 0:
-            print(f"[REFEREE] Stale SQQQ hedge detected ({sqqq_held} shares) in {regime.upper()} — closing")
-            close_crisis_hedges()
+    sqqq_held = get_existing_position_qty(CRISIS_ETF)
+    if sqqq_held > 0:
+        print(f"[REFEREE] Stale SQQQ hedge detected ({sqqq_held} shares) in {regime.upper()} — closing")
+        close_crisis_hedges()
 
     equity = get_account_equity()
     print(f"[REFEREE] Account equity: ${equity:,.2f}")
@@ -925,10 +944,14 @@ def run_cycle():
             is_strong = True
             print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → BUY (score={ens_score:.3f})")
         elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD and sov_dir in ("sell", "neutral"):
-            should_execute = True
-            exec_side = "sell"
-            is_strong = True
-            print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → SELL (score={ens_score:.3f})")
+            # Fix 5: Only SELL override if we actually hold the symbol
+            if alpaca_sym in held_symbols or symbol in held_symbols:
+                should_execute = True
+                exec_side = "sell"
+                is_strong = True
+                print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → SELL (score={ens_score:.3f})")
+            else:
+                print(f"[REFEREE] {symbol}: ENSEMBLE SELL skipped — no position held")
 
         if should_execute:
             # Chop regime: only allow scalps (skip if not ORB-based signal)
