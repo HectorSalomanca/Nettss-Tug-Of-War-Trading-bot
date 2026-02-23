@@ -175,11 +175,11 @@ def get_news_sentiment(symbol: str) -> tuple:
 
 def compute_kelly(win_rate: float, avg_win: float, avg_loss: float) -> float:
     if avg_loss == 0:
-        return 0.0
+        return 0.005  # floor at 0.5%
     b = avg_win / avg_loss
     q = 1 - win_rate
     kelly = (b * win_rate - q) / b
-    return max(0.0, min(kelly * 0.5, 0.25))
+    return max(0.005, min(kelly * 0.5, 0.25))  # floor 0.5%, cap 25%
 
 
 # ── Main Analysis ─────────────────────────────────────────────────────────────
@@ -212,11 +212,14 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     # ── News Sentiment ────────────────────────────────────────
     news_dir, news_conf, bayesian_score = get_news_sentiment(symbol)
 
-    # ── Kelly ─────────────────────────────────────────────────
-    returns = np.diff(prices) / prices[:-1]
-    wins    = returns[returns > 0]
-    losses  = returns[returns < 0]
-    win_rate  = len(wins) / len(returns) if len(returns) > 0 else 0.5
+    # ── Kelly (P6: use 5-day returns to match holding period) ──
+    if len(prices) >= 6:
+        returns_5d = (prices[5:] - prices[:-5]) / prices[:-5]
+    else:
+        returns_5d = np.diff(prices) / prices[:-1]
+    wins    = returns_5d[returns_5d > 0]
+    losses  = returns_5d[returns_5d < 0]
+    win_rate  = len(wins) / len(returns_5d) if len(returns_5d) > 0 else 0.5
     avg_win   = float(np.mean(wins))   if len(wins)   > 0 else 0.01
     avg_loss  = float(abs(np.mean(losses))) if len(losses) > 0 else 0.01
     kelly_fraction = compute_kelly(win_rate, avg_win, avg_loss)

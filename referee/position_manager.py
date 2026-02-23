@@ -15,6 +15,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from typing import Optional
+from collections import defaultdict
 
 import pytz
 from dotenv import load_dotenv
@@ -22,6 +23,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from supabase import create_client, Client
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant.ticker_profiles import get_behavior
 
 load_dotenv()
 
@@ -38,16 +42,24 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 ET = pytz.timezone("America/New_York")
 
 # Default stops (trend regime)
-STOP_LOSS_PCT   = 0.02
-TAKE_PROFIT_PCT = 0.04
+STOP_LOSS_PCT   = 0.019
+TAKE_PROFIT_PCT = 0.038
 EOD_CLOSE_MINS  = 15
 
-# Regime-adjusted stops
+# Off-round stops: trigger slightly before institutional round-number clusters
+# (e.g. 1.9% fires before the crowd's 2% stops get swept)
 REGIME_STOPS = {
-    "trend":  {"stop": 0.02, "take": 0.04},
-    "chop":   {"stop": 0.01, "take": 0.02},
-    "crisis": {"stop": 0.00, "take": 0.00},
+    "trend":       {"stop": 0.019, "take": 0.038},
+    "trend_bull":  {"stop": 0.024, "take": 0.048},
+    "trend_bear":  {"stop": 0.014, "take": 0.029},
+    "chop":        {"stop": 0.009, "take": 0.018},
+    "crisis":      {"stop": 0.00,  "take": 0.00},
 }
+
+# P4: Trailing stop — tracks high-water mark per position
+# Only for momentum_breakout tickers in trend/trend_bull
+TRAILING_STOP_PCT = 0.014  # trail 1.4% below high-water (off-round)
+_high_water_marks = defaultdict(float)  # {symbol: max unrealized_pct seen}
 
 
 def get_open_positions() -> list:
@@ -92,11 +104,32 @@ def _update_trade_record(symbol: str, exit_reason: str):
 def check_stop_take(position, regime: str = "trend") -> Optional[str]:
     try:
         stops = REGIME_STOPS.get(regime, REGIME_STOPS["trend"])
+        symbol = position.symbol
         unrealized_pct = float(position.unrealized_plpc)
+
+        # Fixed stop loss (off-round)
         if unrealized_pct <= -stops["stop"]:
+            _high_water_marks.pop(symbol, None)
             return f"STOP_LOSS ({unrealized_pct:.2%}) [{regime}]"
+
+        # Fixed take profit (off-round)
         if unrealized_pct >= stops["take"]:
+            _high_water_marks.pop(symbol, None)
             return f"TAKE_PROFIT ({unrealized_pct:.2%}) [{regime}]"
+
+        # P4: Trailing stop for momentum tickers in bullish regimes
+        behavior = get_behavior(symbol)
+        if behavior == "momentum_breakout" and regime in ("trend", "trend_bull"):
+            # Update high-water mark
+            if unrealized_pct > _high_water_marks[symbol]:
+                _high_water_marks[symbol] = unrealized_pct
+
+            hwm = _high_water_marks[symbol]
+            # Only activate trailing stop once position is >1% profitable
+            if hwm > 0.01 and unrealized_pct < (hwm - TRAILING_STOP_PCT):
+                _high_water_marks.pop(symbol, None)
+                return f"TRAILING_STOP ({unrealized_pct:.2%}, HWM={hwm:.2%}) [{regime}]"
+
     except Exception:
         pass
     return None

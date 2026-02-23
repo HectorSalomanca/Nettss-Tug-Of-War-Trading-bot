@@ -27,8 +27,11 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
+import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bots import sovereign_agent, madman_agent
@@ -38,7 +41,8 @@ from quant.earnings_filter import filter_watchlist
 from quant.correlation_guard import filter_by_correlation
 from quant.regime_hmm import get_latest_regime_full
 from quant.meta_model import compute_ensemble_score
-from quant.stockformer import predict as stockformer_predict
+from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES
+from quant.feature_factory import build_features
 
 load_dotenv()
 
@@ -57,6 +61,9 @@ data_client       = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 WATCHLIST   = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
 BENCHMARKS  = ["SPY", "QQQ"]   # used for neutralization, not traded
 CRISIS_ETF  = "SQQQ"           # 3× inverse QQQ — bought during Crisis
+
+# Alpaca ticker mapping (some symbols differ from our watchlist names)
+ALPACA_TICKER = {"TSMC": "TSM"}  # Taiwan Semiconductor ADR
 CRISIS_ETF_RISK_PCT  = 0.03    # 3% equity into SQQQ hedge
 CRISIS_SHORT_RISK_PCT = 0.02   # 2% equity into weakest-symbol short
 CRISIS_CONF_THRESHOLD = 0.90   # only hedge if HMM is ≥90% confident in Crisis
@@ -72,13 +79,17 @@ SOVEREIGN_SOLO_CONF = 0.80
 LIMIT_SLIP_PCT      = 0.0005   # limit price = mid ± 0.05% (aggressive, fills like market)
 
 # ── Regime-adjusted stops ─────────────────────────────────────────────────────
+# Off-round numbers: trigger slightly before institutional round-number clusters
+# (e.g. 1.9% stop fires before the crowd's 2% stops get swept)
 REGIME_STOPS = {
-    "trend":       {"stop": 0.02,  "take": 0.04},
-    "trend_bull":  {"stop": 0.025, "take": 0.05},  # V3: wider stops in bull
-    "trend_bear":  {"stop": 0.015, "take": 0.03},  # V3: tighter in bear
-    "chop":        {"stop": 0.01,  "take": 0.02},
+    "trend":       {"stop": 0.019, "take": 0.038},
+    "trend_bull":  {"stop": 0.024, "take": 0.048},
+    "trend_bear":  {"stop": 0.014, "take": 0.029},
+    "chop":        {"stop": 0.009, "take": 0.018},
     "crisis":      {"stop": 0.00,  "take": 0.00},
 }
+ENSEMBLE_BUY_THRESHOLD  = 0.12   # ensemble score > this → execute buy
+ENSEMBLE_SELL_THRESHOLD = -0.12  # ensemble score < this → execute sell
 
 ET = pytz.timezone("America/New_York")
 
@@ -109,15 +120,21 @@ def get_open_position_count() -> int:
         return 0
 
 
+def _alpaca_sym(symbol: str) -> str:
+    """Map internal watchlist name to Alpaca ticker."""
+    return ALPACA_TICKER.get(symbol, symbol)
+
+
 def get_mid_price(symbol: str) -> float:
+    asym = _alpaca_sym(symbol)
     try:
-        req   = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+        req   = StockLatestQuoteRequest(symbol_or_symbols=asym, feed=DataFeed.IEX)
         quote = data_client.get_stock_latest_quote(req)
-        bid   = float(quote[symbol].bid_price or 0)
-        ask   = float(quote[symbol].ask_price or 0)
+        bid   = float(quote[asym].bid_price or 0)
+        ask   = float(quote[asym].ask_price or 0)
         if bid > 0 and ask > 0:
             return (bid + ask) / 2.0
-        return float(quote[symbol].ask_price or quote[symbol].bid_price or 100.0)
+        return float(quote[asym].ask_price or quote[asym].bid_price or 100.0)
     except Exception:
         return 100.0
 
@@ -134,10 +151,135 @@ def compute_qty(symbol: str, kelly_fraction: float, equity: float, is_strong: bo
 
 
 def get_existing_position_qty(symbol: str) -> float:
+    asym = _alpaca_sym(symbol)
     try:
-        return float(trading_client.get_open_position(symbol).qty)
+        return float(trading_client.get_open_position(asym).qty)
     except Exception:
         return 0.0
+
+
+# ── P0: Stockformer Live Feature Builder ──────────────────────────────────
+
+def _build_stockformer_features() -> dict:
+    """
+    Build real feature dict for Stockformer inference from daily bars.
+    Returns {symbol: np.ndarray of shape [SEQ_LEN, N_FEATURES]}.
+    """
+
+    features_dict = {}
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=120)
+
+        # Fetch SPY/QQQ for neutralization
+        benchmarks = {}
+        for bm in BENCHMARKS:
+            req = StockBarsRequest(
+                symbol_or_symbols=bm, timeframe=TimeFrame.Day,
+                start=start, end=end, feed=DataFeed.IEX,
+            )
+            bars = data_client.get_stock_bars(req)
+            df = bars.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(bm, level=0)
+            benchmarks[bm] = df.sort_index()["close"].values
+
+        spy_c = benchmarks.get("SPY", np.array([]))
+        qqq_c = benchmarks.get("QQQ", np.array([]))
+
+        for symbol in WATCHLIST:
+            try:
+                sym_to_fetch = "TSM" if symbol == "TSMC" else symbol
+                req = StockBarsRequest(
+                    symbol_or_symbols=sym_to_fetch, timeframe=TimeFrame.Day,
+                    start=start, end=end, feed=DataFeed.IEX,
+                )
+                bars = data_client.get_stock_bars(req)
+                df = bars.df
+                if isinstance(df.index, pd.MultiIndex):
+                    df = df.xs(sym_to_fetch, level=0)
+                df = df.sort_index()
+
+                closes = df["close"].values
+                volumes = df["volume"].values
+                n = len(closes)
+                if n < SEQ_LEN:
+                    continue
+
+                # Build per-day features
+                feat_arr = np.zeros((n, N_FEATURES))
+
+                # Feature 0: AFD-differenced close (normalized)
+                try:
+                    feats = build_features(closes, spy_c[:n], qqq_c[:n])
+                    afd_val = feats.get("afd_momentum", 0.0)
+                    feat_arr[:, 0] = afd_val  # broadcast scalar
+                except Exception:
+                    pass
+
+                # Feature 1: Volume (log-normalized)
+                log_vol = np.log1p(volumes)
+                mean_v, std_v = np.mean(log_vol), np.std(log_vol) + 1e-8
+                feat_arr[:, 1] = (log_vol - mean_v) / std_v
+
+                # Feature 2: Pure alpha
+                try:
+                    feats = build_features(closes, spy_c[:n], qqq_c[:n])
+                    feat_arr[:, 2] = feats.get("pure_alpha", 0.0)
+                except Exception:
+                    pass
+
+                # Feature 3: Realized vol (20-day rolling)
+                rets = np.diff(closes, prepend=closes[0]) / (closes + 1e-8)
+                rv = pd.Series(rets).rolling(20).std().fillna(0).values
+                mean_rv, std_rv = np.mean(rv), np.std(rv) + 1e-8
+                feat_arr[:, 3] = (rv - mean_rv) / std_rv
+
+                feat_arr = np.nan_to_num(feat_arr, nan=0.0, posinf=0.0, neginf=0.0)
+                features_dict[symbol] = feat_arr
+
+            except Exception as e:
+                print(f"[STOCKFORMER] Feature build error for {symbol}: {e}")
+
+    except Exception as e:
+        print(f"[STOCKFORMER] Global feature build error: {e}")
+
+    return features_dict
+
+
+# ── P5: Order Fill Verification ──────────────────────────────────────────
+
+def _verify_order_fill(alpaca_order_id: str, symbol: str):
+    """Check IOC order status after 2 seconds and update Supabase."""
+    try:
+        time.sleep(2)
+        order = trading_client.get_order_by_id(alpaca_order_id)
+        status = str(order.status).lower()
+        filled_qty = float(order.filled_qty or 0)
+        filled_price = float(order.filled_avg_price or 0)
+
+        if "filled" in status and filled_qty > 0:
+            print(f"[FILL] {symbol}: FILLED {filled_qty} @ ${filled_price:.2f}")
+            if USER_ID:
+                supabase.table("trades").update({
+                    "status": "filled",
+                }).eq("alpaca_order_id", alpaca_order_id).execute()
+        elif "cancel" in status or "expired" in status:
+            print(f"[FILL] {symbol}: {status.upper()} — IOC order did not fill")
+            if USER_ID:
+                supabase.table("trades").update({
+                    "status": "cancelled",
+                }).eq("alpaca_order_id", alpaca_order_id).execute()
+        elif "partial" in status:
+            print(f"[FILL] {symbol}: PARTIAL fill {filled_qty} @ ${filled_price:.2f}")
+            if USER_ID:
+                supabase.table("trades").update({
+                    "status": "partial",
+                }).eq("alpaca_order_id", alpaca_order_id).execute()
+        else:
+            print(f"[FILL] {symbol}: status={status}")
+    except Exception as e:
+        print(f"[FILL] Verification error for {symbol}: {e}")
 
 
 # ── Verdict Logic ─────────────────────────────────────────────────────────────
@@ -376,7 +518,7 @@ def execute_trade(
 
     try:
         order_req = LimitOrderRequest(
-            symbol=symbol,
+            symbol=_alpaca_sym(symbol),
             qty=qty,
             side=order_side,
             time_in_force=TimeInForce.IOC,   # Immediate Or Cancel
@@ -448,12 +590,13 @@ def run_cycle():
         execute_crisis_hedges(equity, crisis_conf)
         return
 
-    # If we just exited Crisis, clean up any open hedges
-    _prev_regime = getattr(run_cycle, "_last_regime", "trend")
-    if _prev_regime == "crisis" and regime != "crisis":
-        print("[REFEREE] Regime flipped out of Crisis — closing hedges")
-        close_crisis_hedges()
-    run_cycle._last_regime = regime
+    # P2: Always clean up stale crisis hedges if regime is NOT crisis
+    # (handles service restarts, not just regime transitions)
+    if regime != "crisis":
+        sqqq_held = get_existing_position_qty(CRISIS_ETF)
+        if sqqq_held > 0:
+            print(f"[REFEREE] Stale SQQQ hedge detected ({sqqq_held} shares) in {regime.upper()} — closing")
+            close_crisis_hedges()
 
     equity = get_account_equity()
     print(f"[REFEREE] Account equity: ${equity:,.2f}")
@@ -463,12 +606,40 @@ def run_cycle():
     if blocked:
         print(f"[REFEREE] Earnings block: {blocked}")
 
+    # ── P0: Build Stockformer live features ──────────────────
+    sf_features = _build_stockformer_features()
+    sf_scores = stockformer_predict(sf_features)
+    for sym, sc in sf_scores.items():
+        if abs(sc) > 0.1:
+            print(f"[STOCKFORMER] {sym}: conviction={sc:+.3f}")
+
     # ── Run bots ──────────────────────────────────────────────
     sovereign_results = sovereign_agent.run(safe_symbols, regime_state=regime)
     madman_results    = madman_agent.run(safe_symbols, regime_state=regime)
 
     s_map = {r["symbol"]: r for r in sovereign_results}
     m_map = {r["symbol"]: r for r in madman_results}
+
+    # ── P1: Compute ensemble scores BEFORE execution ─────────
+    regime_data_full = get_latest_regime_full()
+    state_v3 = regime_data_full.get("state_v3", "")
+    ensemble_map = {}
+    for symbol in safe_symbols:
+        sf = sf_scores.get(symbol, 0.0)
+        m_result = m_map.get(symbol)
+        ofi_z = m_result["raw_data"].get("ofi_z_score", 0.0) if m_result else 0.0
+        iceberg = m_result["raw_data"].get("iceberg_detected", False) if m_result else False
+        stacked = m_result["raw_data"].get("stacked_imbalance", False) if m_result else False
+        trapped = m_result["raw_data"].get("trapped_exhaustion", False) if m_result else False
+        ens = compute_ensemble_score(
+            stockformer_score=sf, ofi_z=ofi_z, iceberg=iceberg,
+            stacked=stacked, trapped=trapped,
+            regime=regime, regime_confidence=crisis_conf,
+            state_v3=state_v3,
+        )
+        ensemble_map[symbol] = ens
+        if ens["ensemble_direction"] != "neutral":
+            print(f"[META] {symbol}: {ens['ensemble_direction'].upper()} score={ens['ensemble_score']:.3f} (SF={ens['stockformer_component']:.3f} OFI={ens['ofi_component']:.3f} HMM={ens['hmm_component']:.3f})")
 
     # ── Exit checks first ─────────────────────────────────────
     position_manager.run_exit_checks(s_map, m_map, regime=regime)
@@ -496,35 +667,62 @@ def run_cycle():
         is_strong = m_result["direction"] != "neutral"
         edge_type = "STRONG" if is_strong else "WEAK"
 
+        # P1: Ensemble override — if ensemble has a strong signal, use it
+        ens = ensemble_map.get(symbol, {})
+        ens_score = ens.get("ensemble_score", 0.0)
+        ens_dir = ens.get("ensemble_direction", "neutral")
+
         print(
             f"[REFEREE] {symbol}: "
             f"Sovereign={verdict['sovereign_direction'].upper()}({verdict['sovereign_confidence']:.2%}) | "
             f"Madman={verdict['madman_direction'].upper()}({verdict['madman_confidence']:.2%}) | "
             f"TugScore={verdict['tug_score']:.2%} | "
+            f"Ensemble={ens_score:+.3f} | "
             f"Verdict={verdict['verdict'].upper()}"
             + (f" [{edge_type}]" if verdict["verdict"] == "execute" else "")
         )
 
+        should_execute = False
+        exec_side = verdict["sovereign_direction"]
+
+        # Original verdict logic
         if verdict["verdict"] == "execute":
+            should_execute = True
+
+        # P1: Ensemble override — strong ensemble signal can trigger execution
+        # even if the old rule-based verdict said no_signal
+        if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD:
+            should_execute = True
+            exec_side = "buy"
+            is_strong = True
+            print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → BUY (score={ens_score:.3f})")
+        elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD:
+            should_execute = True
+            exec_side = "sell"
+            is_strong = True
+            print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → SELL (score={ens_score:.3f})")
+
+        if should_execute:
             # Chop regime: only allow scalps (skip if not ORB-based signal)
             if regime == "chop":
                 orb_dir = s_result["raw_data"].get("orb_breakout", "none")
-                if orb_dir == "none":
-                    print(f"[REFEREE] {symbol}: Chop regime — no ORB signal, skipping")
+                # P7: Also check VWAP deviation in chop
+                if orb_dir == "none" and abs(ens_score) < 0.2:
+                    print(f"[REFEREE] {symbol}: Chop regime — no ORB + weak ensemble, skipping")
                     skipped_no_signal += 1
                     continue
-            execute_candidates.append((symbol, verdict, s_result, is_strong))
+            execute_candidates.append((symbol, verdict, s_result, is_strong, exec_side))
         elif verdict["verdict"] == "crowded_skip":
             skipped_crowded += 1
         else:
             skipped_no_signal += 1
 
     # Apply correlation guard across all candidates
-    candidate_pairs = [(sym, v) for sym, v, _, _ in execute_candidates]
+    candidate_pairs = [(sym, v) for sym, v, _, _, _ in execute_candidates]
     approved_pairs  = filter_by_correlation(candidate_pairs, held_symbols)
     approved_syms   = {sym for sym, _ in approved_pairs}
 
-    for symbol, verdict, s_result, is_strong in execute_candidates:
+    for symbol, verdict, s_result, is_strong, exec_side in execute_candidates:
         if symbol not in approved_syms:
             print(f"[REFEREE] {symbol}: blocked by correlation guard")
             skipped_crowded += 1
@@ -538,35 +736,18 @@ def run_cycle():
         result = execute_trade(
             tug_result_id=log_tug_result(verdict),
             symbol=symbol,
-            side=verdict["sovereign_direction"],
+            side=exec_side,
             kelly_fraction=kelly_fraction,
             equity=equity,
             is_strong=is_strong,
             regime=regime,
         )
         if result:
+            # P5: Verify order fill after 2 seconds
+            _verify_order_fill(result["alpaca_order_id"], symbol)
             open_positions += 1
             executed += 1
             held_symbols.append(symbol)
-
-    # V3: Compute ensemble meta-model scores for logging
-    sf_scores = stockformer_predict({})
-    for symbol in safe_symbols:
-        sf = sf_scores.get(symbol, 0.0)
-        m_result = m_map.get(symbol)
-        ofi_z = m_result["raw_data"].get("ofi_z_score", 0.0) if m_result else 0.0
-        iceberg = m_result["raw_data"].get("iceberg_detected", False) if m_result else False
-        stacked = m_result["raw_data"].get("stacked_imbalance", False) if m_result else False
-        trapped = m_result["raw_data"].get("trapped_exhaustion", False) if m_result else False
-        regime_data_full = get_latest_regime_full()
-        ens = compute_ensemble_score(
-            stockformer_score=sf, ofi_z=ofi_z, iceberg=iceberg,
-            stacked=stacked, trapped=trapped,
-            regime=regime, regime_confidence=crisis_conf,
-            state_v3=regime_data_full.get("state_v3", ""),
-        )
-        if ens["ensemble_direction"] != "neutral":
-            print(f"[META] {symbol}: {ens['ensemble_direction'].upper()} score={ens['ensemble_score']:.3f} (SF={ens['stockformer_component']:.3f} OFI={ens['ofi_component']:.3f} HMM={ens['hmm_component']:.3f})")
 
     print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}")
 
