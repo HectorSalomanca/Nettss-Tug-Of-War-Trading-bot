@@ -307,12 +307,10 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
         direction = "sell"
         base_conf = bear / total
 
-    # 50% feature neutralization against SPY beta
-    vol_penalty = min(neut_vol / 2.0, 0.15)
-    neutralization_factor = 0.5
-    raw_conf = base_conf - vol_penalty
-    neutralized_conf = raw_conf * (1 - neutralization_factor) + 0.5 * neutralization_factor
-    confidence = round(max(0.5, min(neutralized_conf, 0.95)), 4)
+    # Volatility penalty: high idiosyncratic vol reduces confidence
+    # (but does NOT compress toward 50% — that was killing all signals)
+    vol_penalty = min(neut_vol / 3.0, 0.10)
+    confidence = round(max(0.5, min(base_conf - vol_penalty, 0.95)), 4)
 
     raw_data = {
         **details,

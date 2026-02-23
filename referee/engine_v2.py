@@ -69,14 +69,14 @@ CRISIS_SHORT_RISK_PCT = 0.02   # 2% equity into weakest-symbol short
 CRISIS_CONF_THRESHOLD = 0.90   # only hedge if HMM is ≥90% confident in Crisis
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BASE_RISK_PCT   = 0.02    # 2% equity per trade (floor)
-MAX_RISK_PCT    = 0.05    # 5% equity hard cap
+BASE_RISK_PCT   = 0.03    # 3% equity per trade (floor) — 2% was too small
+MAX_RISK_PCT    = 0.06    # 6% equity hard cap
 MAX_OPEN_TRADES = 4
 
 # ── Execution thresholds ──────────────────────────────────────────────────────
-SOVEREIGN_MIN_CONF  = 0.75
-SOVEREIGN_SOLO_CONF = 0.80
-LIMIT_SLIP_PCT      = 0.0005   # limit price = mid ± 0.05% (aggressive, fills like market)
+SOVEREIGN_MIN_CONF  = 0.60   # lowered: old 75% was unreachable with neutralization
+SOVEREIGN_SOLO_CONF = 0.70   # lowered: ensemble override provides real conviction
+LIMIT_SLIP_PCT      = 0.0015   # limit price = mid ± 0.15% (wider — 0.05% was getting 100% IOC cancels)
 
 # ── Regime-adjusted stops ─────────────────────────────────────────────────────
 # Off-round numbers: trigger slightly before institutional round-number clusters
@@ -500,67 +500,93 @@ def execute_trade(
 ) -> Optional[dict]:
 
     qty, mid_price, _ = compute_qty(symbol, kelly_fraction, equity, is_strong)
+    qty = max(int(qty), 1)  # CRITICAL: Limit IOC requires whole shares
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
-    # Sell guard: paper accounts can't fractionally short
+    # Sell guard: if selling, we must hold the position (paper can't naked short)
     if side == "sell":
         held = get_existing_position_qty(symbol)
         if held <= 0:
             print(f"[REFEREE] {symbol}: no position to sell, skipping")
             return None
-        qty = max(float(int(min(held, qty))), 1.0)
+        qty = max(int(min(held, qty)), 1)  # can't sell more than we hold
 
-    # Limit price: mid ± 0.05% (aggressive — fills like market, avoids slippage)
+    # Limit price: mid ± slip% (aggressive enough to fill)
     if side == "buy":
         limit_price = round(mid_price * (1 + LIMIT_SLIP_PCT), 2)
     else:
         limit_price = round(mid_price * (1 - LIMIT_SLIP_PCT), 2)
 
+    asym = _alpaca_sym(symbol)
+    shortfall_bps = round(abs(limit_price - mid_price) / mid_price * 10000, 2)
+
     try:
+        # Strategy: Try IOC first for best execution, fall back to DAY limit
         order_req = LimitOrderRequest(
-            symbol=_alpaca_sym(symbol),
-            qty=qty,
-            side=order_side,
-            time_in_force=TimeInForce.IOC,   # Immediate Or Cancel
-            limit_price=limit_price,
+            symbol=asym, qty=qty, side=order_side,
+            time_in_force=TimeInForce.IOC, limit_price=limit_price,
         )
         order = trading_client.submit_order(order_req)
         alpaca_id = str(order.id)
+        print(f"[REFEREE] IOC submitted: {side.upper()} {int(qty)} {asym} @ ${limit_price} | shortfall={shortfall_bps}bps | ID={alpaca_id}")
 
-        # Implementation shortfall = (limit - mid) / mid * 10000 bps
-        shortfall_bps = round(abs(limit_price - mid_price) / mid_price * 10000, 2)
+        # Check if IOC filled
+        time.sleep(2)
+        order_status = trading_client.get_order_by_id(alpaca_id)
+        status_str = str(order_status.status).lower()
+        filled_qty = float(order_status.filled_qty or 0)
 
-        print(f"[REFEREE] Order submitted: {side.upper()} {qty} {symbol} @ ${limit_price} (IOC) | shortfall={shortfall_bps}bps | ID={alpaca_id}")
+        if "filled" in status_str and filled_qty > 0:
+            filled_price = float(order_status.filled_avg_price or limit_price)
+            real_shortfall = round(abs(filled_price - mid_price) / mid_price * 10000, 2)
+            print(f"[FILL] {asym}: IOC FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
+            if USER_ID:
+                supabase.table("trades").insert({
+                    "tug_result_id": tug_result_id, "symbol": symbol,
+                    "side": side, "qty": int(filled_qty),
+                    "order_type": "limit", "order_type_detail": "limit_ioc",
+                    "limit_price": filled_price, "alpaca_order_id": alpaca_id,
+                    "status": "filled", "implementation_shortfall_bps": real_shortfall,
+                    "user_id": USER_ID,
+                }).execute()
+            return {"alpaca_order_id": alpaca_id, "qty": int(filled_qty), "side": side, "shortfall_bps": real_shortfall}
+
+        # IOC cancelled/expired → fall back to DAY limit with wider slip
+        print(f"[FILL] {asym}: IOC {status_str} — retrying as DAY limit")
+        day_slip = 0.0025  # 0.25% — wider to guarantee fill
+        if side == "buy":
+            day_limit = round(mid_price * (1 + day_slip), 2)
+        else:
+            day_limit = round(mid_price * (1 - day_slip), 2)
+
+        day_req = LimitOrderRequest(
+            symbol=asym, qty=qty, side=order_side,
+            time_in_force=TimeInForce.DAY, limit_price=day_limit,
+        )
+        day_order = trading_client.submit_order(day_req)
+        day_id = str(day_order.id)
+        day_shortfall = round(abs(day_limit - mid_price) / mid_price * 10000, 2)
+        print(f"[REFEREE] DAY fallback: {side.upper()} {int(qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps | ID={day_id}")
 
         if USER_ID:
             supabase.table("trades").insert({
-                "tug_result_id": tug_result_id,
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "order_type": "limit",
-                "order_type_detail": "limit_ioc",
-                "limit_price": limit_price,
-                "alpaca_order_id": alpaca_id,
-                "status": "pending",
-                "implementation_shortfall_bps": shortfall_bps,
+                "tug_result_id": tug_result_id, "symbol": symbol,
+                "side": side, "qty": int(qty),
+                "order_type": "limit", "order_type_detail": "limit_day_fallback",
+                "limit_price": day_limit, "alpaca_order_id": day_id,
+                "status": "pending", "implementation_shortfall_bps": day_shortfall,
                 "user_id": USER_ID,
             }).execute()
-
-        return {"alpaca_order_id": alpaca_id, "qty": qty, "side": side, "shortfall_bps": shortfall_bps}
+        return {"alpaca_order_id": day_id, "qty": int(qty), "side": side, "shortfall_bps": day_shortfall}
 
     except Exception as e:
         print(f"[REFEREE] Order error for {symbol}: {e}")
         if USER_ID:
             supabase.table("trades").insert({
-                "tug_result_id": tug_result_id,
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "order_type": "limit",
-                "order_type_detail": "limit_ioc",
-                "limit_price": limit_price,
-                "status": "rejected",
+                "tug_result_id": tug_result_id, "symbol": symbol,
+                "side": side, "qty": int(qty),
+                "order_type": "limit", "order_type_detail": "limit_ioc",
+                "limit_price": limit_price, "status": "rejected",
                 "user_id": USER_ID,
             }).execute()
         return None
@@ -690,13 +716,14 @@ def run_cycle():
             should_execute = True
 
         # P1: Ensemble override — strong ensemble signal can trigger execution
-        # even if the old rule-based verdict said no_signal
-        if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD:
+        # BUT must agree with Sovereign direction (don't fight the institutional signal)
+        sov_dir = verdict["sovereign_direction"]
+        if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD and sov_dir in ("buy", "neutral"):
             should_execute = True
             exec_side = "buy"
             is_strong = True
             print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → BUY (score={ens_score:.3f})")
-        elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD:
+        elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD and sov_dir in ("sell", "neutral"):
             should_execute = True
             exec_side = "sell"
             is_strong = True
@@ -743,8 +770,6 @@ def run_cycle():
             regime=regime,
         )
         if result:
-            # P5: Verify order fill after 2 seconds
-            _verify_order_fill(result["alpaca_order_id"], symbol)
             open_positions += 1
             executed += 1
             held_symbols.append(symbol)
