@@ -319,7 +319,7 @@ def fetch_historical_returns(symbols: list = None, days: int = 252) -> Tuple[np.
             if isinstance(df.index, pd.MultiIndex):
                 df = df.xs(sym, level=0)
             df = df.sort_index()
-            if len(df) >= days * 0.8:
+            if len(df) >= days * 0.5:
                 all_closes[sym] = df["close"].values[-days:]
         except Exception as e:
             print(f"[SYNTH] Fetch error for {sym}: {e}")
