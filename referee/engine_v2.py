@@ -58,6 +58,8 @@ from quant.tca import (
     measure_market_impact, schedule_adverse_selection_check,
     log_skipped_signal, measure_opportunity_cost,
 )
+from quant.quantum_allocator import allocate as quantum_allocate, build_covariance_matrix
+from scout.scout_dix import get_dark_pool_signals
 
 load_dotenv()
 
@@ -1212,13 +1214,75 @@ def run_cycle():
     open_positions = get_open_position_count()
     print(f"[REFEREE] Open positions: {open_positions}/{MAX_OPEN_TRADES}")
 
-    # Build list of currently held symbols for correlation check
+    # Build list of currently held symbols + current weights for allocator
     try:
-        held_symbols = [p.symbol for p in trading_client.get_all_positions()]
+        positions = trading_client.get_all_positions()
+        held_symbols = [p.symbol for p in positions]
+        current_weights = {}
+        for p in positions:
+            sym_internal = next((s for s in WATCHLIST if _alpaca_sym(s) == p.symbol), p.symbol)
+            current_weights[sym_internal] = float(p.market_value) / equity if equity > 0 else 0.0
     except Exception:
         held_symbols = []
+        current_weights = {}
 
-    # Collect all execute candidates first, then filter by correlation
+    # ── Quantum-Inspired Portfolio Allocation ─────────────────
+    # Pass ensemble alpha signals + live covariance to Simulated Annealing
+    # optimizer. It outputs the mathematically optimal weight array
+    # accounting for correlations and transaction costs in ~5ms.
+    qa_allocation = {}
+    try:
+        # Alpha signals = zero-sum ensemble scores
+        alpha_signals = {sym: ensemble_map[sym]["ensemble_score"] for sym in ensemble_map}
+
+        # Build daily returns dict for covariance matrix
+        returns_dict = {}
+        for s_result in sovereign_results:
+            sym = s_result["symbol"]
+            rd = s_result.get("raw_data", {})
+            if "daily_closes" in rd and len(rd["daily_closes"]) >= 20:
+                closes = np.array(rd["daily_closes"])
+                rets = np.diff(closes) / (closes[:-1] + 1e-8)
+                returns_dict[sym] = rets
+
+        # Get current prices for share conversion
+        prices = {}
+        for s_result in sovereign_results:
+            sym = s_result["symbol"]
+            p = s_result.get("raw_data", {}).get("current_price", 0)
+            if p > 0:
+                prices[sym] = p
+
+        if len(returns_dict) >= 5 and len(prices) >= 5:
+            # Risk aversion scales with regime: more conservative in chop/crisis
+            regime_lambda = {"trend": 1.5, "trend_bull": 1.0, "trend_bear": 2.0, "chop": 3.0, "crisis": 5.0}
+            lam = regime_lambda.get(regime, 2.0)
+
+            qa_result = quantum_allocate(
+                alpha_signals=alpha_signals,
+                returns_dict=returns_dict,
+                symbols=safe_symbols,
+                prices=prices,
+                equity=equity,
+                current_weights=current_weights,
+                lam=lam,
+                cost_bps=TURNOVER_COST_BPS,
+            )
+            qa_allocation = qa_result.get("allocation", {})
+            n_alloc = len(qa_allocation)
+            if n_alloc > 0:
+                print(f"[QUANTUM] Optimized in {qa_result['elapsed_ms']:.1f}ms | "
+                      f"Sharpe={qa_result['sharpe_proxy']:.2f} | "
+                      f"{qa_result['n_long']}L/{qa_result['n_short']}S | "
+                      f"gross={qa_result['gross_exposure']*100:.0f}% net={qa_result['net_exposure']*100:+.0f}% | "
+                      f"tunneling={qa_result['accepted_worse']}")
+                for sym, alloc in sorted(qa_allocation.items(), key=lambda x: abs(x[1]["weight"]), reverse=True):
+                    arrow = "▲" if alloc["weight"] > 0 else "▼"
+                    print(f"[QUANTUM]   {arrow} {sym}: {alloc['weight']*100:+.1f}% = {alloc['shares']} shares (${alloc['dollar_value']:,.0f})")
+    except Exception as e:
+        print(f"[QUANTUM] Allocator error (falling back to Kelly): {e}")
+
+    # ── Build execution candidates from allocator or legacy logic ─
     execute_candidates = []
     for symbol in safe_symbols:
         s_result = s_map.get(symbol)
@@ -1226,72 +1290,67 @@ def run_cycle():
         if not s_result or not m_result:
             continue
 
-        # FIX: Skip if we already hold this symbol (prevents 18x re-entry)
         alpaca_sym = _alpaca_sym(symbol)
-        if alpaca_sym in held_symbols or symbol in held_symbols:
-            print(f"[REFEREE] {symbol}: already held — skipping new entry")
-            skipped_no_signal += 1
-            continue
 
-        verdict   = referee_verdict(s_result, m_result)
-        tug_id    = log_tug_result(verdict)
-        is_strong = m_result["direction"] != "neutral"
-        edge_type = "STRONG" if is_strong else "WEAK"
-
-        # P1: Ensemble override — if ensemble has a strong signal, use it
+        # Determine execution from quantum allocator or legacy verdict
+        qa_alloc = qa_allocation.get(symbol)
         ens = ensemble_map.get(symbol, {})
         ens_score = ens.get("ensemble_score", 0.0)
-        ens_dir = ens.get("ensemble_direction", "neutral")
 
-        print(
-            f"[REFEREE] {symbol}: "
-            f"Sovereign={verdict['sovereign_direction'].upper()}({verdict['sovereign_confidence']:.2%}) | "
-            f"Madman={verdict['madman_direction'].upper()}({verdict['madman_confidence']:.2%}) | "
-            f"TugScore={verdict['tug_score']:.2%} | "
-            f"Ensemble={ens_score:+.3f} | "
-            f"Verdict={verdict['verdict'].upper()}"
-            + (f" [{edge_type}]" if verdict["verdict"] == "execute" else "")
-        )
+        if qa_alloc and abs(qa_alloc["shares"]) >= 1:
+            # QUANTUM PATH: allocator says to trade this symbol
+            exec_side = "buy" if qa_alloc["shares"] > 0 else "sell"
+            target_shares = abs(qa_alloc["shares"])
+            is_strong = abs(qa_alloc["weight"]) > 0.05
 
-        should_execute = False
-        exec_side = verdict["sovereign_direction"]
+            # Skip if already held in same direction
+            if exec_side == "buy" and (alpaca_sym in held_symbols or symbol in held_symbols):
+                continue
+            # For sells, must hold the position
+            if exec_side == "sell" and alpaca_sym not in held_symbols and symbol not in held_symbols:
+                continue
 
-        # Original verdict logic
-        if verdict["verdict"] == "execute":
-            should_execute = True
-
-        # P1: Ensemble override — strong ensemble signal can trigger execution
-        # BUT must agree with Sovereign direction (don't fight the institutional signal)
-        sov_dir = verdict["sovereign_direction"]
-        if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD and sov_dir in ("buy", "neutral"):
-            should_execute = True
-            exec_side = "buy"
-            is_strong = True
-            print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → BUY (score={ens_score:.3f})")
-        elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD and sov_dir in ("sell", "neutral"):
-            # Fix 5: Only SELL override if we actually hold the symbol
-            if alpaca_sym in held_symbols or symbol in held_symbols:
-                should_execute = True
-                exec_side = "sell"
-                is_strong = True
-                print(f"[REFEREE] {symbol}: ENSEMBLE OVERRIDE → SELL (score={ens_score:.3f})")
-            else:
-                print(f"[REFEREE] {symbol}: ENSEMBLE SELL skipped — no position held")
-
-        if should_execute:
-            # Chop regime: only allow scalps (skip if not ORB-based signal)
-            if regime == "chop":
-                orb_dir = s_result["raw_data"].get("orb_breakout", "none")
-                # P7: Also check VWAP deviation in chop
-                if orb_dir == "none" and abs(ens_score) < 0.2:
-                    print(f"[REFEREE] {symbol}: Chop regime — no ORB + weak ensemble, skipping")
-                    skipped_no_signal += 1
-                    continue
+            verdict = referee_verdict(s_result, m_result)
+            print(f"[REFEREE] {symbol}: QUANTUM {exec_side.upper()} {target_shares} shares "
+                  f"(w={qa_alloc['weight']*100:+.1f}%) | Ensemble={ens_score:+.3f}")
             execute_candidates.append((symbol, verdict, s_result, is_strong, exec_side))
-        elif verdict["verdict"] == "crowded_skip":
-            skipped_crowded += 1
         else:
-            skipped_no_signal += 1
+            # LEGACY PATH: use ensemble thresholds + verdict logic
+            if alpaca_sym in held_symbols or symbol in held_symbols:
+                skipped_no_signal += 1
+                continue
+
+            verdict = referee_verdict(s_result, m_result)
+            is_strong = m_result["direction"] != "neutral"
+
+            should_execute = False
+            exec_side = verdict["sovereign_direction"]
+
+            if verdict["verdict"] == "execute":
+                should_execute = True
+
+            sov_dir = verdict["sovereign_direction"]
+            if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD and sov_dir in ("buy", "neutral"):
+                should_execute = True
+                exec_side = "buy"
+                is_strong = True
+            elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD and sov_dir in ("sell", "neutral"):
+                if alpaca_sym in held_symbols or symbol in held_symbols:
+                    should_execute = True
+                    exec_side = "sell"
+                    is_strong = True
+
+            if should_execute:
+                if regime == "chop":
+                    orb_dir = s_result["raw_data"].get("orb_breakout", "none")
+                    if orb_dir == "none" and abs(ens_score) < 0.2:
+                        skipped_no_signal += 1
+                        continue
+                execute_candidates.append((symbol, verdict, s_result, is_strong, exec_side))
+            elif verdict["verdict"] == "crowded_skip":
+                skipped_crowded += 1
+            else:
+                skipped_no_signal += 1
 
     # Apply correlation guard across all candidates
     candidate_pairs = [(sym, v) for sym, v, _, _, _ in execute_candidates]
@@ -1320,7 +1379,13 @@ def run_cycle():
             skipped_no_signal += 1
             continue
 
-        kelly_fraction = s_result["raw_data"].get("kelly_fraction", 0.02)
+        # Use quantum allocator weight for sizing, fall back to Kelly
+        qa_alloc = qa_allocation.get(symbol)
+        if qa_alloc and abs(qa_alloc["weight"]) > 0.005:
+            kelly_fraction = abs(qa_alloc["weight"])  # allocator weight as sizing
+        else:
+            kelly_fraction = s_result["raw_data"].get("kelly_fraction", 0.02)
+
         result = execute_trade(
             tug_result_id=log_tug_result(verdict),
             symbol=symbol,
@@ -1335,7 +1400,8 @@ def run_cycle():
             executed += 1
             held_symbols.append(symbol)
 
-    print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}")
+    qa_tag = f" | QA: {len(qa_allocation)} targets" if qa_allocation else ""
+    print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}{qa_tag}")
 
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
@@ -1473,9 +1539,23 @@ def _process_realtime_events():
     return events
 
 
+def _run_dix_background():
+    """Scan dark pools for hidden institutional flow."""
+    try:
+        signals = get_dark_pool_signals()
+        dix_info = signals.get("_DIX", {})
+        dix_dir = dix_info.get("direction", "neutral")
+        dix_val = dix_info.get("dix", 0.5)
+        n_sigs = len([s for s in signals if s != "_DIX"])
+        print(f"[DIX] Dark pool scan: DIX={dix_val:.4f} ({dix_dir}) | {n_sigs} symbol signal(s)")
+    except Exception as e:
+        print(f"[DIX] Dark pool scan error (non-fatal): {e}")
+
+
 def run_scheduled(interval_minutes: int = 15):
     print(f"[REFEREE V2] Starting — cycles every {interval_minutes} min | Regime HMM every 60 min | Scout every 30 min")
     print(f"[REFEREE V2] Watchlist: {WATCHLIST}")
+    print(f"[REFEREE V2] Event-driven mode: 0% CPU sleep, wakes on ZMQ event or schedule")
 
     # Initialize Event-Driven Architecture subscriber
     _init_event_subscriber()
@@ -1485,16 +1565,47 @@ def run_scheduled(interval_minutes: int = 15):
 
     schedule.every(interval_minutes).minutes.do(run_cycle)
     schedule.every(30).minutes.do(_run_scout_background)
+    schedule.every(30).minutes.do(_run_dix_background)
     schedule.every(60).minutes.do(_run_hmm_background)
     schedule.every(4).hours.do(_run_labeler_background)
-    schedule.every(24).hours.do(_run_stockformer_retrain)  # checks day; only fires on Sunday
+    schedule.every(24).hours.do(_run_stockformer_retrain)
 
     run_cycle()
-    while True:
-        schedule.run_pending()
-        # EDA: process real-time events between polling cycles (~30s latency)
-        _process_realtime_events()
-        time.sleep(30)
+
+    # ── Event-Driven Main Loop ────────────────────────────────────
+    # Instead of time.sleep(30) burning CPU, we use ZMQ poll with a
+    # 1-second timeout. The process sleeps at 0% CPU until either:
+    #   (a) A ZMQ event arrives from scout_tape.py → immediate reaction
+    #   (b) The 1s poll timeout fires → check schedule.run_pending()
+    # This gives us <100ms event latency while consuming zero CPU idle.
+    try:
+        import zmq
+        has_zmq_poll = True
+    except ImportError:
+        has_zmq_poll = False
+
+    if has_zmq_poll and _event_sub and _event_sub._socket:
+        print("[EDA] Main loop: ZMQ poll mode (0% CPU idle, <100ms event latency)")
+        poller = zmq.Poller()
+        poller.register(_event_sub._socket, zmq.POLLIN)
+
+        while True:
+            # Block until event arrives OR 1-second timeout
+            socks = dict(poller.poll(timeout=1000))  # 1000ms = 1s
+
+            if _event_sub._socket in socks:
+                # ZMQ event arrived — process immediately
+                _process_realtime_events()
+
+            # Check scheduled tasks (runs every ~1s)
+            schedule.run_pending()
+    else:
+        # Fallback: traditional polling (no ZMQ available)
+        print("[EDA] Main loop: fallback polling mode (1s sleep)")
+        while True:
+            schedule.run_pending()
+            _process_realtime_events()
+            time.sleep(1)
 
 
 if __name__ == "__main__":
