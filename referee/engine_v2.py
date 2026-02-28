@@ -22,7 +22,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 import pytz
 
-from dotenv import load_dotenv
+# Ensure project root is on sys.path BEFORE any local imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from referee.secret_vault import get_secret
 from supabase import create_client, Client
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -37,7 +40,6 @@ from alpaca.data.enums import DataFeed
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bots import sovereign_agent, madman_agent
 from referee import position_manager
 from quant import regime_hmm
@@ -61,14 +63,12 @@ from quant.tca import (
 from quant.quantum_allocator import allocate as quantum_allocate, build_covariance_matrix
 from scout.scout_dix import get_dark_pool_signals
 
-load_dotenv()
-
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID           = os.getenv("USER_ID")
-PAPER_TRADE       = os.getenv("ALPACA_PAPER_TRADE", "True").lower() == "true"
+ALPACA_API_KEY    = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
+SUPABASE_URL      = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID           = get_secret("USER_ID")
+PAPER_TRADE       = (get_secret("ALPACA_PAPER_TRADE") or "True").lower() == "true"
 
 supabase: Client  = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 trading_client    = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADE)

@@ -29,11 +29,8 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-load_dotenv()
+from referee.secret_vault import get_secret
 
 # ── Device Selection ─────────────────────────────────────────────────────────
 
@@ -492,12 +489,8 @@ def retrain_stockformer():
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
-    from dotenv import load_dotenv
-    import os
-    load_dotenv()
-
     data_client = StockHistoricalDataClient(
-        os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
+        get_secret("ALPACA_API_KEY"), get_secret("ALPACA_SECRET_KEY")
     )
 
     end   = datetime.now(timezone.utc)

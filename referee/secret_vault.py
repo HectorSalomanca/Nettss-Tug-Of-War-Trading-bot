@@ -20,8 +20,10 @@ Fallback: if Keychain read fails, falls back to os.getenv() (backward compatible
 """
 
 import os
+import re
 import subprocess
 import sys
+import logging
 from typing import Optional
 from functools import lru_cache
 
@@ -97,6 +99,49 @@ def _keychain_delete(key: str) -> bool:
         return False
 
 
+# ── Secret leak prevention ──────────────────────────────────────────────────
+# Collect loaded secrets so we can scrub them from any output.
+_loaded_secrets: list[str] = []
+
+
+def scrub(text: str) -> str:
+    """Replace any loaded secret value in *text* with [REDACTED]."""
+    for s in _loaded_secrets:
+        if s and len(s) > 4:
+            text = text.replace(s, "[REDACTED]")
+    return text
+
+
+class _SecretScrubFilter(logging.Filter):
+    """Logging filter that strips secrets from every log record."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = scrub(record.msg)
+        if record.args:
+            record.args = tuple(
+                scrub(a) if isinstance(a, str) else a for a in record.args
+            )
+        return True
+
+
+def install_scrub_filter():
+    """Attach the secret-scrub filter to the root logger (idempotent)."""
+    root = logging.getLogger()
+    if not any(isinstance(f, _SecretScrubFilter) for f in root.filters):
+        root.addFilter(_SecretScrubFilter())
+
+
+# Also monkey-patch builtins.print so even raw print() calls are scrubbed
+import builtins
+_original_print = builtins.print
+
+def _safe_print(*args, **kwargs):
+    safe_args = tuple(scrub(str(a)) if isinstance(a, str) else a for a in args)
+    _original_print(*safe_args, **kwargs)
+
+builtins.print = _safe_print
+
+
 @lru_cache(maxsize=32)
 def get_secret(key: str) -> Optional[str]:
     """
@@ -110,14 +155,20 @@ def get_secret(key: str) -> Optional[str]:
     # Try Keychain first
     value = _keychain_read(key)
     if value:
+        _loaded_secrets.append(value)
         return value
 
     # Fallback to environment variable
     value = os.getenv(key)
     if value:
+        _loaded_secrets.append(value)
         return value
 
     return None
+
+
+# Auto-install the scrub filter on import
+install_scrub_filter()
 
 
 def store_env_to_keychain(env_path: str = ".env") -> dict:

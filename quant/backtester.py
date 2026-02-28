@@ -26,7 +26,6 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from dotenv import load_dotenv
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -35,10 +34,10 @@ from alpaca.data.enums import DataFeed
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant.feature_factory import compute_afd_momentum, neutralize, compute_returns
 
-load_dotenv()
+from referee.secret_vault import get_secret
 
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_API_KEY    = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
 
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 

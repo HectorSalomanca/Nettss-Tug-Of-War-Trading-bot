@@ -18,7 +18,7 @@ from typing import Optional
 from collections import defaultdict
 
 import pytz
-from dotenv import load_dotenv
+from referee.secret_vault import get_secret
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -28,14 +28,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant.ticker_profiles import get_behavior
 from referee.net_guard import with_retry
 
-load_dotenv()
-
-ALPACA_API_KEY   = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-SUPABASE_URL     = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID          = os.getenv("USER_ID")
-PAPER_TRADE      = os.getenv("ALPACA_PAPER_TRADE", "True").lower() == "true"
+ALPACA_API_KEY   = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
+SUPABASE_URL     = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID          = get_secret("USER_ID")
+PAPER_TRADE      = (get_secret("ALPACA_PAPER_TRADE") or "True").lower() == "true"
 
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADE)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)

@@ -16,16 +16,17 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional
 
+import sys
 import httpx
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from referee.secret_vault import get_secret
 from supabase import create_client, Client
 
-load_dotenv()
-
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID           = os.getenv("USER_ID")
+SUPABASE_URL      = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID           = get_secret("USER_ID")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 

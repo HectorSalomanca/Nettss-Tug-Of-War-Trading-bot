@@ -16,14 +16,12 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from dotenv import load_dotenv
+from referee.secret_vault import get_secret
 from supabase import create_client, Client
 
-load_dotenv()
-
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID           = os.getenv("USER_ID")
+SUPABASE_URL      = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID           = get_secret("USER_ID")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 

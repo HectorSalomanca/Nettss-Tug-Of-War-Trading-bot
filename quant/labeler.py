@@ -19,20 +19,18 @@ from typing import Optional
 
 import pytz
 from dateutil import parser as dateutil_parser
-from dotenv import load_dotenv
+from referee.secret_vault import get_secret
 from supabase import create_client, Client
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
-load_dotenv()
-
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID           = os.getenv("USER_ID")
+ALPACA_API_KEY    = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
+SUPABASE_URL      = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID           = get_secret("USER_ID")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)

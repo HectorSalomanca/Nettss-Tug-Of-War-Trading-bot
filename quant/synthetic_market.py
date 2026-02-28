@@ -42,16 +42,14 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-from dotenv import load_dotenv
+from referee.secret_vault import get_secret
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
-load_dotenv()
-
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_API_KEY    = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 WATCHLIST = [

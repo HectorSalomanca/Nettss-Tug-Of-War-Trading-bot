@@ -16,7 +16,11 @@ import asyncio
 import numpy as np
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from dotenv import load_dotenv
+
+# Ensure project root is on sys.path BEFORE any local imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from referee.secret_vault import get_secret
 from supabase import create_client, Client
 from alpaca.data.live import StockDataStream
 
@@ -27,7 +31,6 @@ except ImportError:
     HAS_ARROW = False
 
 # Event-Driven Architecture: ZeroMQ publisher for real-time event broadcast
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from referee.event_bus import (
         get_publisher, EVT_TRAPPED_EXHAUSTION, EVT_ICEBERG_DETECTED,
@@ -39,13 +42,11 @@ except ImportError:
     EVT_TRAPPED_EXHAUSTION = EVT_ICEBERG_DETECTED = EVT_STACKED_IMBALANCE = None
     EVT_OFI_EXTREME = EVT_SPREAD_BLOW = None
 
-load_dotenv()
-
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-USER_ID           = os.getenv("USER_ID")
+ALPACA_API_KEY    = get_secret("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
+SUPABASE_URL      = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_ANON_KEY")
+USER_ID           = get_secret("USER_ID")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
